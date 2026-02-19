@@ -3,6 +3,11 @@
 //! A Rust application for screening DNA sequences using pairwise alignment
 //! to find suitable primer sites with low variability.
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 mod analysis;
 mod app;
 

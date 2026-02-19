@@ -172,3 +172,133 @@ pub fn reverse_complement(seq: &str) -> String {
 pub fn count_ambiguities(seq: &str) -> usize {
     seq.chars().filter(|&c| is_ambiguous_base(c)).count()
 }
+
+// ── Bitmask-based IUPAC operations (zero heap allocation) ──────────────────
+
+/// Bitmask representation: bit 0 = A, bit 1 = C, bit 2 = G, bit 3 = T
+
+/// Lookup table: 4-bit bitmask index -> IUPAC code byte.
+/// Index 0 (no bases) maps to b'?' and should not occur with valid DNA data.
+pub const IUPAC_FROM_MASK: [u8; 16] = [
+    b'?', // 0b0000 - no bases (invalid)
+    b'A', // 0b0001
+    b'C', // 0b0010
+    b'M', // 0b0011 - A|C
+    b'G', // 0b0100
+    b'R', // 0b0101 - A|G
+    b'S', // 0b0110 - C|G
+    b'V', // 0b0111 - A|C|G
+    b'T', // 0b1000
+    b'W', // 0b1001 - A|T
+    b'Y', // 0b1010 - C|T
+    b'H', // 0b1011 - A|C|T
+    b'K', // 0b1100 - G|T
+    b'D', // 0b1101 - A|G|T
+    b'B', // 0b1110 - C|G|T
+    b'N', // 0b1111 - A|C|G|T
+];
+
+/// Convert a DNA base byte to its bitmask. Also handles IUPAC ambiguity codes.
+/// Returns 0 for unrecognized bytes.
+#[inline]
+pub fn base_to_bit(b: u8) -> u8 {
+    match b {
+        b'A' => 0b0001,
+        b'C' => 0b0010,
+        b'G' => 0b0100,
+        b'T' => 0b1000,
+        b'R' => 0b0101,
+        b'Y' => 0b1010,
+        b'S' => 0b0110,
+        b'W' => 0b1001,
+        b'K' => 0b1100,
+        b'M' => 0b0011,
+        b'B' => 0b1110,
+        b'D' => 0b1101,
+        b'H' => 0b1011,
+        b'V' => 0b0111,
+        b'N' => 0b1111,
+        _ => 0,
+    }
+}
+
+/// Convert an IUPAC code byte to a bitmask of the bases it represents.
+/// Returns 0 for unrecognized bytes.
+#[inline]
+pub fn iupac_to_mask(b: u8) -> u8 {
+    base_to_bit(b)
+}
+
+/// Check if a sequence matches a consensus using byte-level bitmask comparison.
+/// Zero-allocation equivalent of `sequence_matches_consensus`.
+#[inline]
+pub fn sequence_matches_consensus_bytes(seq: &[u8], consensus: &[u8]) -> bool {
+    if seq.len() != consensus.len() {
+        return false;
+    }
+    for i in 0..seq.len() {
+        let base_mask = base_to_bit(seq[i]);
+        let cons_mask = iupac_to_mask(consensus[i]);
+        if base_mask & cons_mask == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bitmask_roundtrip() {
+        let codes = b"ACGTRYSWKMBDHVN";
+        for &code in codes {
+            let mask = iupac_to_mask(code);
+            assert_eq!(
+                IUPAC_FROM_MASK[mask as usize], code,
+                "Roundtrip failed for '{}'", code as char
+            );
+        }
+    }
+
+    #[test]
+    fn test_base_to_bit() {
+        assert_eq!(base_to_bit(b'A'), 0b0001);
+        assert_eq!(base_to_bit(b'C'), 0b0010);
+        assert_eq!(base_to_bit(b'G'), 0b0100);
+        assert_eq!(base_to_bit(b'T'), 0b1000);
+        assert_eq!(base_to_bit(b'X'), 0);
+    }
+
+    #[test]
+    fn test_sequence_matches_consensus_bytes() {
+        assert!(sequence_matches_consensus_bytes(b"ACGT", b"ACGT"));
+        assert!(sequence_matches_consensus_bytes(b"ACGT", b"NCGT"));
+        assert!(sequence_matches_consensus_bytes(b"ACGT", b"RCGT"));
+        assert!(!sequence_matches_consensus_bytes(b"ACGT", b"YCGT"));
+        assert!(!sequence_matches_consensus_bytes(b"ACG", b"ACGT"));
+    }
+
+    #[test]
+    fn test_bitmask_matches_hashset_impl() {
+        let cases = vec![
+            ("ACGT", "ACGT", true),
+            ("ACGT", "NCGT", true),
+            ("ACGT", "RCGT", true),
+            ("TCGT", "RCGT", false),
+            ("ACGT", "MCGT", true),
+            ("GCGT", "MCGT", false),
+        ];
+        for (seq, cons, expected) in cases {
+            assert_eq!(
+                sequence_matches_consensus(seq, cons), expected,
+                "HashSet impl: seq={} cons={}", seq, cons
+            );
+            assert_eq!(
+                sequence_matches_consensus_bytes(seq.as_bytes(), cons.as_bytes()), expected,
+                "Bitmask impl: seq={} cons={}", seq, cons
+            );
+        }
+    }
+}

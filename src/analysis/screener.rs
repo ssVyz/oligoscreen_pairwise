@@ -5,7 +5,7 @@
 
 use super::analyzer::analyze_sequences;
 use super::fasta::{ReferenceData, TemplateData};
-use super::pairwise::collect_matches;
+use super::pairwise::{collect_matches_with_aligner, create_aligner, DnaAligner};
 use super::types::{
     AnalysisParams, LengthResult, PositionResult, ProgressUpdate, ScreeningResults,
     WindowAnalysisResult,
@@ -70,7 +70,8 @@ pub fn run_screening(
     results
 }
 
-/// Analyze all positions for a specific oligo length
+/// Analyze all positions for a specific oligo length.
+/// Uses `map_init` to create one Aligner per rayon task (roughly per thread).
 fn analyze_length(
     template: &TemplateData,
     ref_bytes: &[Vec<u8>],
@@ -97,45 +98,53 @@ fn analyze_length(
     let completed_count = Arc::new(AtomicUsize::new(0));
     let template_bytes = template.sequence.as_bytes();
 
-    // Process positions in parallel
+    // Pre-compute max reference length for aligner sizing
+    let max_ref_len = ref_bytes.iter().map(|r| r.len()).max().unwrap_or(0);
+    let pw_params = params.pairwise;
+
+    // Process positions in parallel, one Aligner per rayon task
     let mut position_results: Vec<PositionResult> = positions
         .par_iter()
-        .map(|&position| {
-            let analysis = analyze_window(
-                template_bytes,
-                ref_bytes,
-                params,
-                position,
-                length,
-            );
+        .map_init(
+            move || create_aligner(length, max_ref_len, &pw_params),
+            |aligner, &position| {
+                let analysis = analyze_window(
+                    template_bytes,
+                    ref_bytes,
+                    params,
+                    position,
+                    length,
+                    aligner,
+                );
 
-            // Update progress
-            let completed = completed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if let Some(tx) = progress_tx {
-                if completed % 10 == 0 || completed == total_positions {
-                    let _ = tx.send(ProgressUpdate {
-                        current_length: oligo_length,
-                        current_position: position,
-                        total_positions,
-                        lengths_completed: length_idx,
-                        total_lengths,
-                        message: format!(
-                            "Length {}/{}: Position {}/{}",
-                            length_idx + 1,
+                // Update progress
+                let completed = completed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(tx) = progress_tx {
+                    if completed % 10 == 0 || completed == total_positions {
+                        let _ = tx.send(ProgressUpdate {
+                            current_length: oligo_length,
+                            current_position: position,
+                            total_positions,
+                            lengths_completed: length_idx,
                             total_lengths,
-                            completed,
-                            total_positions
-                        ),
-                    });
+                            message: format!(
+                                "Length {}/{}: Position {}/{}",
+                                length_idx + 1,
+                                total_lengths,
+                                completed,
+                                total_positions
+                            ),
+                        });
+                    }
                 }
-            }
 
-            PositionResult {
-                position,
-                variants_needed: analysis.variants_for_threshold,
-                analysis,
-            }
-        })
+                PositionResult {
+                    position,
+                    variants_needed: analysis.variants_for_threshold,
+                    analysis,
+                }
+            },
+        )
         .collect();
 
     // Sort results by position
@@ -147,21 +156,22 @@ fn analyze_length(
     }
 }
 
-/// Analyze a single window at a specific position using pairwise alignment.
+/// Analyze a single window at a specific position using a pre-existing aligner.
 fn analyze_window(
     template_bytes: &[u8],
     ref_bytes: &[Vec<u8>],
     params: &AnalysisParams,
     position: usize,
     length: usize,
+    aligner: &mut DnaAligner,
 ) -> WindowAnalysisResult {
     // Extract oligo from template
     let oligo = &template_bytes[position..position + length];
     let total_refs = ref_bytes.len();
 
-    // Pairwise align against all references
+    // Pairwise align against all references using the shared aligner
     let (matched_sequences, no_match_count) =
-        collect_matches(oligo, ref_bytes, &params.pairwise);
+        collect_matches_with_aligner(aligner, oligo, ref_bytes, &params.pairwise);
 
     if matched_sequences.is_empty() {
         return WindowAnalysisResult {

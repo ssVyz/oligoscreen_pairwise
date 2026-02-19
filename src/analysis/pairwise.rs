@@ -3,10 +3,29 @@
 //! Uses Smith-Waterman local alignment from the bio crate to find the best
 //! match for each template oligo in each reference sequence.
 
-use bio::alignment::pairwise::Aligner;
+use bio::alignment::pairwise::{Aligner, MatchFunc, MatchParams};
 use bio::alignment::AlignmentOperation;
 
 use super::types::PairwiseParams;
+
+/// Concrete Aligner type using MatchParams (nameable, unlike closure-based Aligners).
+pub type DnaAligner = Aligner<MatchParams>;
+
+/// Create an Aligner sized for the given dimensions.
+pub fn create_aligner(
+    oligo_len: usize,
+    max_ref_len: usize,
+    params: &PairwiseParams,
+) -> DnaAligner {
+    let match_fn = MatchParams::new(params.match_score, params.mismatch_score);
+    Aligner::with_capacity(
+        oligo_len,
+        max_ref_len,
+        params.gap_open_penalty,
+        params.gap_extend_penalty,
+        match_fn,
+    )
+}
 
 /// Result of aligning an oligo against a single reference sequence
 #[derive(Debug, Clone)]
@@ -23,7 +42,51 @@ pub struct PairwiseMatch {
     pub full_coverage: bool,
 }
 
+/// Process an alignment result from a pre-existing aligner.
+/// Shared logic used by both standalone alignment and batch collection.
+fn process_alignment<F: MatchFunc>(
+    aligner: &mut Aligner<F>,
+    oligo: &[u8],
+    reference: &[u8],
+) -> PairwiseMatch {
+    let alignment = aligner.local(oligo, reference);
+
+    let mut has_gaps = false;
+    let mut mismatches = 0;
+
+    for op in &alignment.operations {
+        match op {
+            AlignmentOperation::Match => {}
+            AlignmentOperation::Subst => {
+                mismatches += 1;
+            }
+            AlignmentOperation::Del | AlignmentOperation::Ins => {
+                has_gaps = true;
+            }
+            AlignmentOperation::Xclip(_) | AlignmentOperation::Yclip(_) => {}
+        }
+    }
+
+    let aligned_query_len = alignment.xend - alignment.xstart;
+    let full_coverage = aligned_query_len == oligo.len();
+
+    let matched_sequence = if !has_gaps && full_coverage {
+        String::from_utf8_lossy(&reference[alignment.ystart..alignment.yend]).to_string()
+    } else {
+        String::new()
+    };
+
+    PairwiseMatch {
+        matched_sequence,
+        score: alignment.score,
+        mismatches,
+        has_gaps,
+        full_coverage,
+    }
+}
+
 /// Align an oligo against a single reference sequence using local alignment.
+/// Creates its own aligner — use `collect_matches` for batch alignment.
 pub fn align_oligo_to_reference(
     oligo: &[u8],
     reference: &[u8],
@@ -42,48 +105,13 @@ pub fn align_oligo_to_reference(
         },
     );
 
-    let alignment = aligner.local(oligo, reference);
-
-    // Check for gaps and count mismatches by inspecting operations
-    let mut has_gaps = false;
-    let mut mismatches = 0;
-
-    for op in &alignment.operations {
-        match op {
-            AlignmentOperation::Match => {}
-            AlignmentOperation::Subst => {
-                mismatches += 1;
-            }
-            AlignmentOperation::Del | AlignmentOperation::Ins => {
-                has_gaps = true;
-            }
-            AlignmentOperation::Xclip(_) | AlignmentOperation::Yclip(_) => {
-                // Clipping at boundaries of local alignment, not counted
-            }
-        }
-    }
-
-    // Check if the alignment covers the full query (oligo)
-    let aligned_query_len = alignment.xend - alignment.xstart;
-    let full_coverage = aligned_query_len == oligo.len();
-
-    // Extract matched reference sequence (only meaningful if gap-free)
-    let matched_sequence = if !has_gaps && full_coverage {
-        String::from_utf8_lossy(&reference[alignment.ystart..alignment.yend]).to_string()
-    } else {
-        String::new()
-    };
-
-    PairwiseMatch {
-        matched_sequence,
-        score: alignment.score,
-        mismatches,
-        has_gaps,
-        full_coverage,
-    }
+    process_alignment(&mut aligner, oligo, reference)
 }
 
 /// Align an oligo against all reference sequences and collect valid matches.
+///
+/// Creates a single aligner sized for the longest reference and reuses it
+/// for all alignments, avoiding repeated large allocations.
 ///
 /// Returns (matched_sequences, no_match_count).
 /// A match is rejected (counted as "no match") if:
@@ -98,8 +126,53 @@ pub fn collect_matches(
     let mut matched = Vec::new();
     let mut no_match_count = 0;
 
+    if references.is_empty() {
+        return (matched, no_match_count);
+    }
+
+    // Create a single aligner sized for the longest reference, reused for all alignments.
+    // This avoids re-allocating the O(m*n) DP matrices for every reference.
+    let max_ref_len = references.iter().map(|r| r.len()).max().unwrap();
+    let match_score = params.match_score;
+    let mismatch_score = params.mismatch_score;
+
+    let mut aligner = Aligner::with_capacity(
+        oligo.len(),
+        max_ref_len,
+        params.gap_open_penalty,
+        params.gap_extend_penalty,
+        |a: u8, b: u8| -> i32 {
+            if a == b { match_score } else { mismatch_score }
+        },
+    );
+
     for reference in references {
-        let result = align_oligo_to_reference(oligo, reference, params);
+        let result = process_alignment(&mut aligner, oligo, reference);
+
+        if !result.full_coverage || result.has_gaps || result.mismatches > params.max_mismatches as usize
+        {
+            no_match_count += 1;
+        } else {
+            matched.push(result.matched_sequence);
+        }
+    }
+
+    (matched, no_match_count)
+}
+
+/// Align an oligo against all references using a pre-existing aligner.
+/// The aligner must be sized for at least (oligo.len(), max_ref_len).
+pub fn collect_matches_with_aligner(
+    aligner: &mut DnaAligner,
+    oligo: &[u8],
+    references: &[Vec<u8>],
+    params: &PairwiseParams,
+) -> (Vec<String>, usize) {
+    let mut matched = Vec::new();
+    let mut no_match_count = 0;
+
+    for reference in references {
+        let result = process_alignment(aligner, oligo, reference);
 
         if !result.full_coverage || result.has_gaps || result.mismatches > params.max_mismatches as usize
         {

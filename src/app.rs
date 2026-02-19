@@ -619,10 +619,10 @@ impl OligoscreenApp {
 
                 ui.horizontal(|ui| {
                     ui.label("Match score:");
-                    ui.add(egui::DragValue::new(&mut self.params.pairwise.match_score).range(-10..=10));
+                    ui.add(egui::DragValue::new(&mut self.params.pairwise.match_score).range(0..=10));
                     ui.add_space(20.0);
                     ui.label("Mismatch score:");
-                    ui.add(egui::DragValue::new(&mut self.params.pairwise.mismatch_score).range(-10..=10));
+                    ui.add(egui::DragValue::new(&mut self.params.pairwise.mismatch_score).range(-10..=0));
                 });
 
                 ui.horizontal(|ui| {

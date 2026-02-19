@@ -1,7 +1,7 @@
 //! Core analysis algorithms for oligo variant detection
 
 use std::collections::{HashMap, HashSet};
-use super::iupac::{bases_to_iupac, sequence_matches_consensus};
+use super::iupac::{base_to_bit, sequence_matches_consensus_bytes, IUPAC_FROM_MASK};
 use super::types::{AnalysisMethod, Variant, WindowAnalysisResult};
 
 /// Analyze sequences using the specified method
@@ -138,7 +138,8 @@ fn find_minimum_variants_greedy(
     variants
 }
 
-/// Find the best consensus that covers the most sequences within ambiguity limit
+/// Find the best consensus that covers the most sequences within ambiguity limit.
+/// Uses bitmask tracking for zero-allocation inner loop.
 fn find_best_consensus<'a>(
     uncovered: &HashSet<&'a str>,
     seq_counts: &HashMap<&'a str, usize>,
@@ -149,42 +150,62 @@ fn find_best_consensus<'a>(
     let mut best_coverage: HashSet<&str> = HashSet::new();
     let mut best_score = 0usize;
 
-    // Sort by frequency for seed selection
     let mut uncovered_sorted: Vec<_> = uncovered.iter().copied().collect();
     uncovered_sorted.sort_by_key(|&s| std::cmp::Reverse(seq_counts.get(s).unwrap_or(&0)));
 
-    // Try each sequence as a seed (limit for performance)
-    for &seed_seq in uncovered_sorted.iter().take(50) {
-        let mut potential_group: Vec<&str> = vec![seed_seq];
+    let seq_len = uncovered_sorted.first().map(|s| s.len()).unwrap_or(0);
+    if seq_len == 0 {
+        return (best_consensus, best_coverage);
+    }
 
-        // Try adding other sequences
+    let mut group_mask: Vec<u8> = vec![0u8; seq_len];
+
+    for &seed_seq in uncovered_sorted.iter().take(50) {
+        // Initialize group_mask from seed
+        let seed_bytes = seed_seq.as_bytes();
+        for pos in 0..seq_len {
+            group_mask[pos] = base_to_bit(seed_bytes[pos]);
+        }
+
+        // Try adding other sequences incrementally
         for &other_seq in uncovered {
             if other_seq == seed_seq {
                 continue;
             }
 
-            let combined: Vec<&str> = potential_group.iter().copied()
-                .chain(std::iter::once(other_seq))
-                .collect();
+            let other_bytes = other_seq.as_bytes();
+            let mut trial_amb_count = 0usize;
+            let mut trial_valid = true;
 
-            let (_, amb_count, is_valid) = create_consensus_from_seqs(&combined, exclude_n);
+            for pos in 0..seq_len {
+                let m = group_mask[pos] | base_to_bit(other_bytes[pos]);
+                if m.count_ones() > 1 {
+                    trial_amb_count += 1;
+                    if (exclude_n && m == 0b1111) || trial_amb_count > max_ambiguities {
+                        trial_valid = false;
+                        break;
+                    }
+                }
+            }
 
-            if is_valid && amb_count <= max_ambiguities {
-                potential_group.push(other_seq);
+            if trial_valid {
+                // Accept: update group_mask in-place
+                for pos in 0..seq_len {
+                    group_mask[pos] |= base_to_bit(other_bytes[pos]);
+                }
             }
         }
 
-        // Create final consensus for this group
-        let (consensus, _, is_valid) = create_consensus_from_seqs(&potential_group, exclude_n);
-
+        let (consensus, _, is_valid) = consensus_from_mask(&group_mask, exclude_n);
         if !is_valid {
             continue;
         }
 
         // Check actual coverage
+        let consensus_bytes = consensus.as_bytes();
         let mut coverage: HashSet<&str> = HashSet::new();
         for &seq in uncovered {
-            if sequence_matches_consensus(seq, &consensus) {
+            if sequence_matches_consensus_bytes(seq.as_bytes(), consensus_bytes) {
                 coverage.insert(seq);
             }
         }
@@ -222,7 +243,6 @@ fn find_incremental_variants(
         let remaining_total = remaining.len();
         let target_count = ((target_percentage / 100.0) * remaining_total as f64).ceil() as usize;
 
-        // Get counts of unique sequences in remaining pool
         let mut remaining_counts: HashMap<&str, usize> = HashMap::new();
         for &seq in &remaining {
             *remaining_counts.entry(seq).or_insert(0) += 1;
@@ -245,14 +265,15 @@ fn find_incremental_variants(
             percentage,
         });
 
-        // Remove covered sequences from remaining pool
-        remaining.retain(|&seq| !sequence_matches_consensus(seq, &best_consensus));
+        // Remove covered sequences using byte-level matching
+        let best_bytes = best_consensus.as_bytes();
+        remaining.retain(|&seq| !sequence_matches_consensus_bytes(seq.as_bytes(), best_bytes));
     }
 
     variants
 }
 
-/// Find consensus for incremental method
+/// Find consensus for incremental method using bitmask tracking.
 fn find_incremental_consensus(
     unique_remaining: &[&str],
     remaining_counts: &HashMap<&str, usize>,
@@ -269,48 +290,65 @@ fn find_incremental_consensus(
     let mut best_coverage_count = 0usize;
     let mut found_target = false;
 
-    // Determine the maximum ambiguity level to try
     let max_amb_level = max_ambiguities.unwrap_or(seq_len);
 
-    // Try increasing ambiguity levels up to the limit
+    // Allocated once per call, reused across all seeds and amb_levels
+    let mut group_mask: Vec<u8> = vec![0u8; seq_len];
+
     for amb_level in 0..=max_amb_level {
         if found_target {
             break;
         }
 
-        // Sort by frequency
         let mut sorted_remaining: Vec<_> = unique_remaining.to_vec();
         sorted_remaining.sort_by_key(|&s| std::cmp::Reverse(remaining_counts.get(s).unwrap_or(&0)));
 
         for &seed_seq in sorted_remaining.iter().take(50) {
-            let mut potential_group: Vec<&str> = vec![seed_seq];
+            // Initialize group_mask from seed
+            let seed_bytes = seed_seq.as_bytes();
+            for pos in 0..seq_len {
+                group_mask[pos] = base_to_bit(seed_bytes[pos]);
+            }
 
+            // Try adding other sequences incrementally via bitmask
             for &other_seq in unique_remaining {
                 if other_seq == seed_seq {
                     continue;
                 }
 
-                let combined: Vec<&str> = potential_group.iter().copied()
-                    .chain(std::iter::once(other_seq))
-                    .collect();
+                let other_bytes = other_seq.as_bytes();
+                let mut trial_amb_count = 0usize;
+                let mut trial_valid = true;
 
-                let (_, amb_count, is_valid) = create_consensus_from_seqs(&combined, exclude_n);
+                for pos in 0..seq_len {
+                    let m = group_mask[pos] | base_to_bit(other_bytes[pos]);
+                    if m.count_ones() > 1 {
+                        trial_amb_count += 1;
+                        if (exclude_n && m == 0b1111) || trial_amb_count > amb_level {
+                            trial_valid = false;
+                            break;
+                        }
+                    }
+                }
 
-                if is_valid && amb_count <= amb_level {
-                    potential_group.push(other_seq);
+                if trial_valid {
+                    for pos in 0..seq_len {
+                        group_mask[pos] |= base_to_bit(other_bytes[pos]);
+                    }
                 }
             }
 
-            let (consensus, amb_count, is_valid) = create_consensus_from_seqs(&potential_group, exclude_n);
+            let (consensus, amb_count, is_valid) = consensus_from_mask(&group_mask, exclude_n);
 
             if !is_valid || amb_count > amb_level {
                 continue;
             }
 
-            // Check actual coverage
+            // Check actual coverage using byte-level matching
+            let consensus_bytes = consensus.as_bytes();
             let mut coverage_count = 0usize;
             for &seq in unique_remaining {
-                if sequence_matches_consensus(seq, &consensus) {
+                if sequence_matches_consensus_bytes(seq.as_bytes(), consensus_bytes) {
                     coverage_count += remaining_counts.get(seq).unwrap_or(&0);
                 }
             }
@@ -328,9 +366,6 @@ fn find_incremental_consensus(
         }
     }
 
-    // If we have a max ambiguity limit and couldn't reach target, accept best within limit
-    // (This is already handled above - best_coverage_count tracks the best we found)
-
     // Fallback
     if best_consensus.is_empty() && !unique_remaining.is_empty() {
         let most_freq = unique_remaining
@@ -345,7 +380,25 @@ fn find_incremental_consensus(
     (best_consensus, best_coverage_count)
 }
 
-/// Create consensus from sequences
+/// Build a consensus String from a bitmask array.
+/// Returns (consensus, ambiguity_count, is_valid).
+fn consensus_from_mask(mask: &[u8], exclude_n: bool) -> (String, usize, bool) {
+    let mut consensus = String::with_capacity(mask.len());
+    let mut amb_count = 0;
+    for &m in mask {
+        let code = IUPAC_FROM_MASK[m as usize];
+        if m.count_ones() > 1 {
+            amb_count += 1;
+            if exclude_n && code == b'N' {
+                return (consensus, amb_count, false);
+            }
+        }
+        consensus.push(code as char);
+    }
+    (consensus, amb_count, true)
+}
+
+/// Create consensus from sequences using bitmask arithmetic.
 fn create_consensus_from_seqs(sequences: &[&str], exclude_n: bool) -> (String, usize, bool) {
     if sequences.is_empty() {
         return (String::new(), 0, true);
@@ -356,23 +409,22 @@ fn create_consensus_from_seqs(sequences: &[&str], exclude_n: bool) -> (String, u
     let mut ambiguity_count = 0;
 
     for pos in 0..seq_len {
-        let mut bases_at_pos: HashSet<char> = HashSet::new();
+        let mut mask: u8 = 0;
         for &seq in sequences {
-            if let Some(c) = seq.chars().nth(pos) {
-                bases_at_pos.insert(c);
+            let bytes = seq.as_bytes();
+            if pos < bytes.len() {
+                mask |= base_to_bit(bytes[pos]);
             }
         }
 
-        if bases_at_pos.len() == 1 {
-            consensus.push(*bases_at_pos.iter().next().unwrap());
-        } else {
-            let code = bases_to_iupac(&bases_at_pos);
-            if exclude_n && code == 'N' {
+        let code = IUPAC_FROM_MASK[mask as usize];
+        if mask.count_ones() > 1 {
+            if exclude_n && code == b'N' {
                 return (consensus, ambiguity_count, false);
             }
-            consensus.push(code);
             ambiguity_count += 1;
         }
+        consensus.push(code as char);
     }
 
     (consensus, ambiguity_count, true)
@@ -422,5 +474,22 @@ mod tests {
         let (n, cov) = calculate_variants_for_threshold(&variants, 100, 80.0);
         assert_eq!(n, 2);
         assert_eq!(cov, 80.0);
+    }
+
+    #[test]
+    fn test_incremental_variants() {
+        let seqs = vec!["ACGT", "ACGT", "ACGA", "ACGA", "ACGA", "TCGT", "TCGT"];
+        let variants = find_incremental_variants(&seqs, 50.0, false, Some(1));
+        assert!(!variants.is_empty());
+        let total_count: usize = variants.iter().map(|v| v.count).sum();
+        assert_eq!(total_count, 7);
+    }
+
+    #[test]
+    fn test_fixed_ambiguities() {
+        let seqs = vec!["ACGT", "ACGA"];
+        let variants = find_minimum_variants_greedy(&seqs, 1, false);
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].count, 2);
     }
 }
