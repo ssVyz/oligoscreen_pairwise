@@ -1,15 +1,16 @@
-#[allow(unused_imports)]
+//! Analysis engine for oligonucleotide screening
+//!
+//! This module provides the core analysis functionality for screening
+//! aligned DNA sequences for suitable primer sites.
+
 mod types;
 mod iupac;
 mod fasta;
 mod analyzer;
-mod aligner;
 mod screener;
 
 pub use types::*;
 pub use iupac::*;
 pub use fasta::*;
-#[allow(unused_imports)]
 pub use analyzer::*;
-pub use aligner::*;
 pub use screener::*;

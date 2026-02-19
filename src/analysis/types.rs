@@ -1,29 +1,20 @@
 //! Data types for oligo analysis
-#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Alignment scoring parameters for pairwise alignment
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AlignmentScoringParams {
-    pub match_score: i32,
-    pub mismatch_score: i32,
-    pub gap_open: i32,
-    pub gap_extend: i32,
-    /// Minimum alignment score as fraction of perfect score to consider valid
-    pub min_score_fraction: f64,
+/// Analysis mode selection
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnalysisMode {
+    /// Screen entire alignment with sliding windows
+    ScreenAlignment,
+    /// Analyze a single oligo region (alignment is one oligo)
+    SingleOligoRegion,
 }
 
-impl Default for AlignmentScoringParams {
+impl Default for AnalysisMode {
     fn default() -> Self {
-        Self {
-            match_score: 1,
-            mismatch_score: -1,
-            gap_open: -5,
-            gap_extend: -1,
-            min_score_fraction: 0.5,
-        }
+        Self::ScreenAlignment
     }
 }
 
@@ -85,6 +76,7 @@ impl ThreadCount {
 /// Global analysis parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisParams {
+    pub mode: AnalysisMode,
     pub method: AnalysisMethod,
     pub exclude_n: bool,
     pub min_oligo_length: u32,
@@ -92,12 +84,12 @@ pub struct AnalysisParams {
     pub resolution: u32,
     pub coverage_threshold: f64,
     pub thread_count: ThreadCount,
-    pub alignment_scoring: AlignmentScoringParams,
 }
 
 impl Default for AnalysisParams {
     fn default() -> Self {
         Self {
+            mode: AnalysisMode::ScreenAlignment,
             method: AnalysisMethod::NoAmbiguities,
             exclude_n: false,
             min_oligo_length: 18,
@@ -105,7 +97,6 @@ impl Default for AnalysisParams {
             resolution: 1,
             coverage_threshold: 95.0,
             thread_count: ThreadCount::Auto,
-            alignment_scoring: AlignmentScoringParams::default(),
         }
     }
 }

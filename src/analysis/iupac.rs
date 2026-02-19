@@ -1,5 +1,4 @@
 //! IUPAC ambiguity codes and DNA sequence utilities
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use once_cell::sync::Lazy;

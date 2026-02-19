@@ -327,6 +327,9 @@ fn find_incremental_consensus(
         }
     }
 
+    // If we have a max ambiguity limit and couldn't reach target, accept best within limit
+    // (This is already handled above - best_coverage_count tracks the best we found)
+
     // Fallback
     if best_consensus.is_empty() && !unique_remaining.is_empty() {
         let most_freq = unique_remaining
@@ -375,7 +378,7 @@ fn create_consensus_from_seqs(sequences: &[&str], exclude_n: bool) -> (String, u
 }
 
 /// Calculate how many variants are needed to reach coverage threshold
-pub fn calculate_variants_for_threshold(
+fn calculate_variants_for_threshold(
     variants: &[Variant],
     total: usize,
     threshold: f64,
@@ -393,4 +396,30 @@ pub fn calculate_variants_for_threshold(
     }
 
     (variants.len(), cumulative)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_no_ambiguities() {
+        let seqs = vec!["ACGT", "ACGT", "ACGA", "ACGA", "ACGA"];
+        let variants = find_variants_no_ambiguities(&seqs);
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].sequence, "ACGA");
+        assert_eq!(variants[0].count, 3);
+    }
+
+    #[test]
+    fn test_calculate_threshold() {
+        let variants = vec![
+            Variant { sequence: "A".to_string(), count: 50, percentage: 50.0 },
+            Variant { sequence: "B".to_string(), count: 30, percentage: 30.0 },
+            Variant { sequence: "C".to_string(), count: 20, percentage: 20.0 },
+        ];
+        let (n, cov) = calculate_variants_for_threshold(&variants, 100, 80.0);
+        assert_eq!(n, 2);
+        assert_eq!(cov, 80.0);
+    }
 }
