@@ -956,12 +956,12 @@ impl OligoscreenApp {
             return;
         }
 
-        // Cell dimensions
-        let cell_w = (14.0 * self.zoom_level).max(6.0);
-        let cell_h = (18.0 * self.zoom_level).max(10.0);
-        let label_width = 50.0; // Width for row labels
-        let header_height = 30.0 * self.zoom_level; // Height for template sequence row
-        let pos_label_height = 16.0 * self.zoom_level;
+        // Cell dimensions: zoom only affects horizontal width, height is fixed
+        let cell_w = (14.0 * self.zoom_level).max(3.0);
+        let cell_h: f32 = 54.0;
+        let label_width: f32 = 50.0;
+        let header_height: f32 = 20.0;
+        let pos_label_height: f32 = 14.0;
 
         let num_cols = positions.len();
         let num_rows = lengths.len();
@@ -1025,7 +1025,7 @@ impl OligoscreenApp {
         let total_height =
             pos_label_height + header_height + (num_rows as f32 * cell_h) + 30.0; // +30 for legend
 
-        egui::ScrollArea::horizontal()
+        let scroll_output = egui::ScrollArea::horizontal()
             .id_salt("heatmap_scroll")
             .show(ui, |ui| {
                 let (response, painter) = ui.allocate_painter(
@@ -1051,27 +1051,45 @@ impl OligoscreenApp {
                         egui::pos2(x, y),
                         egui::Align2::CENTER_CENTER,
                         format!("{}", pos + 1),
-                        egui::FontId::proportional(8.0 * self.zoom_level.min(1.5)),
+                        egui::FontId::proportional(9.0),
                         egui::Color32::GRAY,
                     );
                 }
 
                 // --- Template sequence row ---
                 let seq_y_start = origin.y + pos_label_height;
-                for (col, &pos) in positions.iter().enumerate() {
-                    if pos < template_seq.len() {
-                        let base = &template_seq[pos..pos + 1];
-                        let x = origin.x + label_width + (col as f32 * cell_w) + cell_w / 2.0;
-                        let y = seq_y_start + header_height / 2.0;
+                // Only draw base letters when cells are wide enough to read
+                if cell_w >= 8.0 {
+                    for (col, &pos) in positions.iter().enumerate() {
+                        if pos < template_seq.len() {
+                            let base = &template_seq[pos..pos + 1];
+                            let x =
+                                origin.x + label_width + (col as f32 * cell_w) + cell_w / 2.0;
+                            let y = seq_y_start + header_height / 2.0;
 
-                        let color = base_color(base.chars().next().unwrap_or('N'));
-                        painter.text(
-                            egui::pos2(x, y),
-                            egui::Align2::CENTER_CENTER,
-                            base,
-                            egui::FontId::monospace(10.0 * self.zoom_level.min(1.5)),
-                            color,
-                        );
+                            let color = base_color(base.chars().next().unwrap_or('N'));
+                            painter.text(
+                                egui::pos2(x, y),
+                                egui::Align2::CENTER_CENTER,
+                                base,
+                                egui::FontId::monospace(11.0),
+                                color,
+                            );
+                        }
+                    }
+                } else {
+                    // When zoomed out too far for letters, draw colored ticks
+                    for (col, &pos) in positions.iter().enumerate() {
+                        if pos < template_seq.len() {
+                            let base_char = template_seq.as_bytes()[pos] as char;
+                            let color = base_color(base_char);
+                            let x = origin.x + label_width + (col as f32 * cell_w);
+                            let tick_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, seq_y_start + 2.0),
+                                egui::vec2((cell_w - 1.0).max(1.0), header_height - 4.0),
+                            );
+                            painter.rect_filled(tick_rect, 0.0, color);
+                        }
                     }
                 }
 
@@ -1083,7 +1101,7 @@ impl OligoscreenApp {
                         egui::pos2(origin.x + label_width - 5.0, y),
                         egui::Align2::RIGHT_CENTER,
                         format!("{} bp", length),
-                        egui::FontId::proportional(10.0 * self.zoom_level.min(1.5)),
+                        egui::FontId::proportional(11.0),
                         egui::Color32::LIGHT_GRAY,
                     );
                 }
@@ -1183,6 +1201,23 @@ impl OligoscreenApp {
                     self.show_detail_window = true;
                 }
             });
+
+        // Redirect vertical mouse wheel to horizontal scroll when hovering over heatmap
+        if let Some(hover_pos) = ui.ctx().pointer_hover_pos() {
+            if scroll_output.inner_rect.contains(hover_pos) {
+                let vertical_delta = ui.input(|i| i.smooth_scroll_delta.y);
+                if vertical_delta.abs() > 0.1 {
+                    let mut state = scroll_output.state;
+                    state.offset.x -= vertical_delta;
+                    state.offset.x = state.offset.x.clamp(
+                        0.0,
+                        (total_width - scroll_output.inner_rect.width()).max(0.0),
+                    );
+                    state.store(ui.ctx(), scroll_output.id);
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
 
         // Legend
         // Legend: show a gradient from green_at to red_at using actual color function
@@ -1483,9 +1518,10 @@ fn add_codon_spacing(seq: &str) -> String {
 /// Get color for a position based on variant count, no-match fraction,
 /// and user-configurable green/red thresholds.
 ///
+/// Uses a 3-color gradient: green → yellow → red.
 /// - At `green_at` variants (or fewer): fully green
+/// - At midpoint between green_at and red_at: yellow
 /// - At `red_at` variants (or more): fully red
-/// - Between: linear interpolation from green to red
 /// - No-match fraction overrides toward red regardless of variant count
 fn position_color(
     variant_count: usize,
@@ -1497,12 +1533,12 @@ fn position_color(
         return egui::Color32::from_rgb(40, 40, 40);
     }
 
-    // Compute base color by interpolating between green and red
+    // 3-stop gradient: green (0,180,0) → yellow (220,200,0) → red (220,50,50)
     let green = (0.0f64, 180.0f64, 0.0f64);
+    let yellow = (220.0f64, 200.0f64, 0.0f64);
     let red = (220.0f64, 50.0f64, 50.0f64);
 
     let t = if red_at <= green_at {
-        // Degenerate case: everything at or above green_at is green, else red
         if variant_count <= green_at { 0.0 } else { 1.0 }
     } else if variant_count <= green_at {
         0.0
@@ -1512,9 +1548,22 @@ fn position_color(
         (variant_count - green_at) as f64 / (red_at - green_at) as f64
     };
 
-    let base_r = green.0 + (red.0 - green.0) * t;
-    let base_g = green.1 + (red.1 - green.1) * t;
-    let base_b = green.2 + (red.2 - green.2) * t;
+    // Interpolate through green → yellow (t=0..0.5) → red (t=0.5..1.0)
+    let (base_r, base_g, base_b) = if t <= 0.5 {
+        let s = t * 2.0; // 0..1 within the first half
+        (
+            green.0 + (yellow.0 - green.0) * s,
+            green.1 + (yellow.1 - green.1) * s,
+            green.2 + (yellow.2 - green.2) * s,
+        )
+    } else {
+        let s = (t - 0.5) * 2.0; // 0..1 within the second half
+        (
+            yellow.0 + (red.0 - yellow.0) * s,
+            yellow.1 + (red.1 - yellow.1) * s,
+            yellow.2 + (red.2 - yellow.2) * s,
+        )
+    };
 
     // Blend toward red based on no-match fraction
     let nm = no_match_fraction.clamp(0.0, 1.0);
