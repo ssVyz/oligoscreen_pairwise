@@ -1,6 +1,6 @@
-//! Oligoscreen Tool - Primer Site Screening Tool
+//! Oligoscreen Pairwise - Primer Site Screening Tool
 //!
-//! A Rust application for screening large sets of aligned DNA sequences
+//! A Rust application for screening DNA sequences using pairwise alignment
 //! to find suitable primer sites with low variability.
 
 pub mod analysis;

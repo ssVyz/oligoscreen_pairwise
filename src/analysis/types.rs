@@ -3,21 +3,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Analysis mode selection
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AnalysisMode {
-    /// Screen entire alignment with sliding windows
-    ScreenAlignment,
-    /// Analyze a single oligo region (alignment is one oligo)
-    SingleOligoRegion,
-}
-
-impl Default for AnalysisMode {
-    fn default() -> Self {
-        Self::ScreenAlignment
-    }
-}
-
 /// Analysis method selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AnalysisMethod {
@@ -73,11 +58,33 @@ impl ThreadCount {
     }
 }
 
+/// Pairwise alignment parameters
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PairwiseParams {
+    pub match_score: i32,
+    pub mismatch_score: i32,
+    pub gap_open_penalty: i32,
+    pub gap_extend_penalty: i32,
+    pub max_mismatches: u32,
+}
+
+impl Default for PairwiseParams {
+    fn default() -> Self {
+        Self {
+            match_score: 2,
+            mismatch_score: -1,
+            gap_open_penalty: -2,
+            gap_extend_penalty: -1,
+            max_mismatches: 5,
+        }
+    }
+}
+
 /// Global analysis parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisParams {
-    pub mode: AnalysisMode,
     pub method: AnalysisMethod,
+    pub pairwise: PairwiseParams,
     pub exclude_n: bool,
     pub min_oligo_length: u32,
     pub max_oligo_length: u32,
@@ -89,8 +96,8 @@ pub struct AnalysisParams {
 impl Default for AnalysisParams {
     fn default() -> Self {
         Self {
-            mode: AnalysisMode::ScreenAlignment,
             method: AnalysisMethod::NoAmbiguities,
+            pairwise: PairwiseParams::default(),
             exclude_n: false,
             min_oligo_length: 18,
             max_oligo_length: 25,
@@ -115,6 +122,7 @@ pub struct WindowAnalysisResult {
     pub variants: Vec<Variant>,
     pub total_sequences: usize,
     pub sequences_analyzed: usize,
+    pub no_match_count: usize,
     pub variants_for_threshold: usize,
     pub coverage_at_threshold: f64,
     pub skipped: bool,
@@ -127,6 +135,7 @@ impl Default for WindowAnalysisResult {
             variants: Vec::new(),
             total_sequences: 0,
             sequences_analyzed: 0,
+            no_match_count: 0,
             variants_for_threshold: 0,
             coverage_at_threshold: 0.0,
             skipped: false,
@@ -140,10 +149,9 @@ impl Default for WindowAnalysisResult {
 pub struct LengthResult {
     pub oligo_length: u32,
     pub positions: Vec<PositionResult>,
-    pub consensus_sequence: String,
 }
 
-/// Result at a specific alignment position
+/// Result at a specific template position
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionResult {
     pub position: usize,
@@ -155,19 +163,24 @@ pub struct PositionResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreeningResults {
     pub params: AnalysisParams,
-    pub alignment_length: usize,
+    pub template_length: usize,
     pub total_sequences: usize,
-    pub consensus_sequence: String,
+    pub template_sequence: String,
     pub results_by_length: HashMap<u32, LengthResult>,
 }
 
 impl ScreeningResults {
-    pub fn new(params: AnalysisParams, alignment_length: usize, total_sequences: usize, consensus: String) -> Self {
+    pub fn new(
+        params: AnalysisParams,
+        template_length: usize,
+        total_sequences: usize,
+        template_sequence: String,
+    ) -> Self {
         Self {
             params,
-            alignment_length,
+            template_length,
             total_sequences,
-            consensus_sequence: consensus,
+            template_sequence,
             results_by_length: HashMap::new(),
         }
     }

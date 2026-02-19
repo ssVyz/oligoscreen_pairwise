@@ -1,68 +1,59 @@
-//! Alignment screening logic
+//! Screening logic using pairwise alignment
 //!
-//! Iterates through aligned sequences with different window sizes
-//! to find regions with low variability suitable for primer design.
+//! Iterates through the template sequence with different oligo lengths,
+//! using pairwise alignment to find best matches in each reference sequence.
 
 use super::analyzer::analyze_sequences;
-use super::fasta::{
-    compute_consensus, extract_window, filter_window_sequences, AlignmentData,
-};
+use super::fasta::{ReferenceData, TemplateData};
+use super::pairwise::collect_matches;
 use super::types::{
-    AnalysisMode, AnalysisParams, LengthResult, PositionResult, ProgressUpdate,
-    ScreeningResults, WindowAnalysisResult,
+    AnalysisParams, LengthResult, PositionResult, ProgressUpdate, ScreeningResults,
+    WindowAnalysisResult,
 };
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-/// Maximum percentage of sequences with gaps/ambiguities before skipping window
-const MAX_EXCLUDED_PERCENTAGE: f64 = 20.0;
-
-/// Run the complete screening analysis
+/// Run the complete screening analysis using pairwise alignment.
 pub fn run_screening(
-    data: &AlignmentData,
+    template: &TemplateData,
+    references: &ReferenceData,
     params: &AnalysisParams,
     progress_tx: Option<Sender<ProgressUpdate>>,
 ) -> ScreeningResults {
-    match params.mode {
-        AnalysisMode::ScreenAlignment => run_screen_alignment(data, params, progress_tx),
-        AnalysisMode::SingleOligoRegion => run_single_oligo_analysis(data, params, progress_tx),
-    }
-}
-
-/// Run screen alignment mode (sliding window analysis)
-fn run_screen_alignment(
-    data: &AlignmentData,
-    params: &AnalysisParams,
-    progress_tx: Option<Sender<ProgressUpdate>>,
-) -> ScreeningResults {
-    // Configure rayon thread pool based on user settings
+    // Configure rayon thread pool
     let num_threads = params.thread_count.get_count();
-
-    // Build a custom thread pool for this analysis
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build()
-        .unwrap_or_else(|_| {
-            // Fallback to default pool if custom pool fails
-            rayon::ThreadPoolBuilder::new().build().unwrap()
-        });
+        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
 
-    let consensus = compute_consensus(data);
     let mut results = ScreeningResults::new(
         params.clone(),
-        data.alignment_length,
-        data.len(),
-        consensus,
+        template.sequence.len(),
+        references.len(),
+        template.sequence.clone(),
     );
+
+    // Pre-convert reference sequences to byte vectors for alignment
+    let ref_bytes: Vec<Vec<u8>> = references
+        .sequences
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+    let ref_bytes = Arc::new(ref_bytes);
 
     let total_lengths = params.max_oligo_length - params.min_oligo_length + 1;
 
-    for (length_idx, oligo_length) in (params.min_oligo_length..=params.max_oligo_length).enumerate() {
+    for (length_idx, oligo_length) in
+        (params.min_oligo_length..=params.max_oligo_length).enumerate()
+    {
+        let ref_bytes = Arc::clone(&ref_bytes);
         let length_result = pool.install(|| {
             analyze_length(
-                data,
+                template,
+                &ref_bytes,
                 params,
                 oligo_length,
                 length_idx as u32,
@@ -71,114 +62,18 @@ fn run_screen_alignment(
             )
         });
 
-        results.results_by_length.insert(oligo_length, length_result);
+        results
+            .results_by_length
+            .insert(oligo_length, length_result);
     }
 
     results
-}
-
-/// Run single oligo region analysis (entire alignment is one oligo)
-fn run_single_oligo_analysis(
-    data: &AlignmentData,
-    params: &AnalysisParams,
-    progress_tx: Option<Sender<ProgressUpdate>>,
-) -> ScreeningResults {
-    let consensus = compute_consensus(data);
-    let oligo_length = data.alignment_length as u32;
-
-    let mut results = ScreeningResults::new(
-        params.clone(),
-        data.alignment_length,
-        data.len(),
-        consensus.clone(),
-    );
-
-    // Send progress update
-    if let Some(ref tx) = progress_tx {
-        let _ = tx.send(ProgressUpdate {
-            current_length: oligo_length,
-            current_position: 0,
-            total_positions: 1,
-            lengths_completed: 0,
-            total_lengths: 1,
-            message: "Analyzing single oligo region...".to_string(),
-        });
-    }
-
-    // Filter sequences: drop any with gaps or ambiguous bases
-    let filtered_sequences: Vec<&str> = data
-        .sequences
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|seq| !has_gaps_or_ambiguities(seq))
-        .collect();
-
-    let total_sequences = data.len();
-    let sequences_analyzed = filtered_sequences.len();
-
-    // Run analysis on filtered sequences
-    let analysis = if filtered_sequences.is_empty() {
-        WindowAnalysisResult {
-            skipped: true,
-            skip_reason: Some("No valid sequences after filtering gaps/ambiguities".to_string()),
-            total_sequences,
-            sequences_analyzed: 0,
-            ..Default::default()
-        }
-    } else {
-        let mut result = analyze_sequences(
-            &filtered_sequences,
-            &params.method,
-            params.exclude_n,
-            params.coverage_threshold,
-        );
-        result.total_sequences = total_sequences;
-        result.sequences_analyzed = sequences_analyzed;
-        result
-    };
-
-    // Create length result with single position
-    let length_result = LengthResult {
-        oligo_length,
-        positions: vec![PositionResult {
-            position: 0,
-            variants_needed: analysis.variants_for_threshold,
-            analysis,
-        }],
-        consensus_sequence: consensus,
-    };
-
-    results.results_by_length.insert(oligo_length, length_result);
-
-    // Send completion progress
-    if let Some(ref tx) = progress_tx {
-        let _ = tx.send(ProgressUpdate {
-            current_length: oligo_length,
-            current_position: 0,
-            total_positions: 1,
-            lengths_completed: 1,
-            total_lengths: 1,
-            message: "Analysis complete".to_string(),
-        });
-    }
-
-    results
-}
-
-/// Check if a sequence contains gaps or ambiguous bases
-fn has_gaps_or_ambiguities(seq: &str) -> bool {
-    seq.chars().any(|c| {
-        let upper = c.to_ascii_uppercase();
-        // Gap characters
-        upper == '-' || upper == '.'
-        // Ambiguous bases (anything that's not A, C, G, T)
-        || (upper != 'A' && upper != 'C' && upper != 'G' && upper != 'T')
-    })
 }
 
 /// Analyze all positions for a specific oligo length
 fn analyze_length(
-    data: &AlignmentData,
+    template: &TemplateData,
+    ref_bytes: &[Vec<u8>],
     params: &AnalysisParams,
     oligo_length: u32,
     length_idx: u32,
@@ -187,10 +82,11 @@ fn analyze_length(
 ) -> LengthResult {
     let length = oligo_length as usize;
     let resolution = params.resolution as usize;
+    let template_len = template.sequence.len();
 
-    // Calculate number of positions
-    let max_start = if data.alignment_length >= length {
-        data.alignment_length - length
+    // Calculate positions to analyze
+    let max_start = if template_len >= length {
+        template_len - length
     } else {
         0
     };
@@ -198,30 +94,24 @@ fn analyze_length(
     let positions: Vec<usize> = (0..=max_start).step_by(resolution).collect();
     let total_positions = positions.len();
 
-    // Build consensus for this length (most common sequence at each window)
-    let mut length_consensus = String::new();
-    if let Some(&first_pos) = positions.first() {
-        let windows = extract_window(data, first_pos, length);
-        if !windows.is_empty() {
-            length_consensus = compute_window_consensus(&windows);
-        }
-    }
-
-    // Progress counter for parallel execution
     let completed_count = Arc::new(AtomicUsize::new(0));
+    let template_bytes = template.sequence.as_bytes();
 
     // Process positions in parallel
     let mut position_results: Vec<PositionResult> = positions
         .par_iter()
         .map(|&position| {
-            let analysis = analyze_window(data, params, position, length);
+            let analysis = analyze_window(
+                template_bytes,
+                ref_bytes,
+                params,
+                position,
+                length,
+            );
 
-            // Update progress (atomic increment)
+            // Update progress
             let completed = completed_count.fetch_add(1, Ordering::Relaxed) + 1;
-
-            // Send progress update (best effort, non-blocking)
             if let Some(tx) = progress_tx {
-                // Only send periodic updates to avoid flooding the channel
                 if completed % 10 == 0 || completed == total_positions {
                     let _ = tx.send(ProgressUpdate {
                         current_length: oligo_length,
@@ -248,146 +138,129 @@ fn analyze_length(
         })
         .collect();
 
-    // Sort results by position (parallel processing may return them out of order)
+    // Sort results by position
     position_results.sort_by_key(|r| r.position);
 
     LengthResult {
         oligo_length,
         positions: position_results,
-        consensus_sequence: length_consensus,
     }
 }
 
-/// Analyze a single window at a specific position
+/// Analyze a single window at a specific position using pairwise alignment.
 fn analyze_window(
-    data: &AlignmentData,
+    template_bytes: &[u8],
+    ref_bytes: &[Vec<u8>],
     params: &AnalysisParams,
     position: usize,
     length: usize,
 ) -> WindowAnalysisResult {
-    // Extract window sequences
-    let windows = extract_window(data, position, length);
-    let total = windows.len();
+    // Extract oligo from template
+    let oligo = &template_bytes[position..position + length];
+    let total_refs = ref_bytes.len();
 
-    if total == 0 {
+    // Pairwise align against all references
+    let (matched_sequences, no_match_count) =
+        collect_matches(oligo, ref_bytes, &params.pairwise);
+
+    if matched_sequences.is_empty() {
         return WindowAnalysisResult {
+            total_sequences: total_refs,
+            sequences_analyzed: 0,
+            no_match_count,
             skipped: true,
-            skip_reason: Some("No sequences at this position".to_string()),
-            total_sequences: 0,
+            skip_reason: Some("No valid matches found in any reference sequence".to_string()),
             ..Default::default()
         };
     }
 
-    // Filter sequences with gaps and ambiguous bases
-    let (filtered, gap_count, ambiguous_count) = filter_window_sequences(&windows);
+    // Convert to &str for the analyzer
+    let seq_refs: Vec<&str> = matched_sequences.iter().map(|s| s.as_str()).collect();
 
-    // Check if too many sequences have gaps
-    let gap_percentage = (gap_count as f64 / total as f64) * 100.0;
-    if gap_percentage > MAX_EXCLUDED_PERCENTAGE {
-        return WindowAnalysisResult {
-            skipped: true,
-            skip_reason: Some(format!(
-                "Too many gaps: {:.1}% of sequences",
-                gap_percentage
-            )),
-            total_sequences: total,
-            ..Default::default()
-        };
-    }
-
-    // Check if too many sequences have ambiguous bases
-    let ambiguous_percentage = (ambiguous_count as f64 / total as f64) * 100.0;
-    if ambiguous_percentage > MAX_EXCLUDED_PERCENTAGE {
-        return WindowAnalysisResult {
-            skipped: true,
-            skip_reason: Some(format!(
-                "Too many ambiguous bases: {:.1}% of sequences",
-                ambiguous_percentage
-            )),
-            total_sequences: total,
-            ..Default::default()
-        };
-    }
-
-    if filtered.is_empty() {
-        return WindowAnalysisResult {
-            skipped: true,
-            skip_reason: Some("No valid sequences after filtering".to_string()),
-            total_sequences: total,
-            ..Default::default()
-        };
-    }
-
-    // Run the analysis
+    // Run the variant analysis on matched sequences
     let mut result = analyze_sequences(
-        &filtered,
+        &seq_refs,
         &params.method,
         params.exclude_n,
         params.coverage_threshold,
     );
 
-    result.total_sequences = total;
-    result.sequences_analyzed = filtered.len();
+    result.total_sequences = total_refs;
+    result.sequences_analyzed = matched_sequences.len();
+    result.no_match_count = no_match_count;
 
-    result
-}
-
-/// Compute consensus for a window (most common base at each position)
-fn compute_window_consensus(windows: &[&str]) -> String {
-    if windows.is_empty() {
-        return String::new();
-    }
-
-    let length = windows[0].len();
-    let mut consensus = String::with_capacity(length);
-
-    for pos in 0..length {
-        let mut counts = std::collections::HashMap::new();
-
-        for &window in windows {
-            if let Some(c) = window.chars().nth(pos) {
-                if c != '-' && c != '.' {
-                    *counts.entry(c).or_insert(0) += 1;
-                }
+    // Rescale variant percentages against total references (including no-matches)
+    // so that no-match sequences count toward reducing coverage
+    if total_refs > matched_sequences.len() {
+        let total_f = total_refs as f64;
+        for variant in &mut result.variants {
+            variant.percentage = (variant.count as f64 / total_f) * 100.0;
+        }
+        // Recalculate variants needed for threshold with rescaled percentages
+        let mut cumulative = 0.0;
+        let mut new_variants_needed = result.variants.len();
+        let mut new_coverage = 0.0;
+        for (i, variant) in result.variants.iter().enumerate() {
+            cumulative += variant.percentage;
+            if cumulative >= params.coverage_threshold {
+                new_variants_needed = i + 1;
+                new_coverage = cumulative;
+                break;
             }
         }
-
-        if counts.is_empty() {
-            consensus.push('-');
-        } else {
-            let most_common = counts
-                .into_iter()
-                .max_by_key(|&(_, count)| count)
-                .map(|(c, _)| c)
-                .unwrap_or('-');
-            consensus.push(most_common);
+        if cumulative < params.coverage_threshold {
+            new_coverage = cumulative;
         }
+        result.variants_for_threshold = new_variants_needed;
+        result.coverage_at_threshold = new_coverage;
     }
 
-    consensus
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::fasta::parse_fasta;
     use crate::analysis::types::AnalysisMethod;
 
     #[test]
-    fn test_screening() {
-        let fasta = ">Seq1\nACGTACGT\n>Seq2\nACGTACGT\n>Seq3\nACGAACGT";
-        let data = parse_fasta(fasta).unwrap();
+    fn test_screening_example() {
+        let template = TemplateData {
+            name: "Template".to_string(),
+            sequence: "TATGGTACGTCATGTTCTAGAAATGGGCTGT".to_string(),
+        };
+
+        let references = ReferenceData {
+            names: vec![
+                "Ref1".to_string(),
+                "Ref2".to_string(),
+                "Ref3".to_string(),
+                "Ref4".to_string(),
+            ],
+            sequences: vec![
+                "TATGGTACGTCATGTTCTAGAAATGGGCTGT".to_string(),
+                "AATATGGTACGTCATGTTCTAGAAATGGGCTGT".to_string(),
+                "TATGGTTCGTCATGTTCTAGAAATGGGCTGTTTT".to_string(),
+                "GTATGGTACGTCATGTTCTAGAAATGGGCTGT".to_string(),
+            ],
+        };
 
         let params = AnalysisParams {
             method: AnalysisMethod::NoAmbiguities,
-            exclude_n: false,
-            min_oligo_length: 4,
-            max_oligo_length: 4,
+            min_oligo_length: 10,
+            max_oligo_length: 10,
             resolution: 1,
             coverage_threshold: 95.0,
+            ..Default::default()
         };
 
-        let results = run_screening(&data, &params, None);
-        assert!(results.results_by_length.contains_key(&4));
+        let results = run_screening(&template, &references, &params, None);
+        assert!(results.results_by_length.contains_key(&10));
+
+        let length_result = results.results_by_length.get(&10).unwrap();
+        // First position should have variants
+        let first_pos = &length_result.positions[0];
+        assert!(!first_pos.analysis.skipped);
+        assert!(first_pos.analysis.variants.len() >= 1);
     }
 }

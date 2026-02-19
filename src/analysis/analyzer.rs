@@ -44,6 +44,7 @@ pub fn analyze_sequences(
         variants,
         total_sequences: total,
         sequences_analyzed: total,
+        no_match_count: 0,
         variants_for_threshold: variants_needed,
         coverage_at_threshold,
         skipped: false,

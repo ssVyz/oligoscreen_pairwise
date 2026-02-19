@@ -1,21 +1,26 @@
-//! FASTA file parsing for aligned sequences
+//! FASTA file parsing for template and reference sequences
 
 use super::iupac::{is_ambiguous_base, is_gap, is_standard_base};
 
-/// Parsed alignment data
+/// Parsed template sequence (single sequence)
 #[derive(Debug, Clone)]
-pub struct AlignmentData {
-    pub sequences: Vec<String>,
-    pub names: Vec<String>,
-    pub alignment_length: usize,
+pub struct TemplateData {
+    pub name: String,
+    pub sequence: String,
 }
 
-impl AlignmentData {
+/// Parsed reference sequences (multiple, unaligned)
+#[derive(Debug, Clone)]
+pub struct ReferenceData {
+    pub sequences: Vec<String>,
+    pub names: Vec<String>,
+}
+
+impl ReferenceData {
     pub fn new() -> Self {
         Self {
             sequences: Vec::new(),
             names: Vec::new(),
-            alignment_length: 0,
         }
     }
 
@@ -28,16 +33,63 @@ impl AlignmentData {
     }
 }
 
-impl Default for AlignmentData {
+impl Default for ReferenceData {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Parse FASTA format text and extract aligned sequences
-/// Handles gaps and normalizes sequences to the same length
-pub fn parse_fasta(text: &str) -> Result<AlignmentData, String> {
-    let mut data = AlignmentData::new();
+/// Parse a single-sequence FASTA as template.
+/// Returns error if input contains 0 or more than 1 sequence.
+pub fn parse_template_fasta(text: &str) -> Result<TemplateData, String> {
+    let (names, sequences) = parse_fasta_sequences(text)?;
+
+    if sequences.is_empty() {
+        return Err("No valid sequence found in template input".to_string());
+    }
+    if sequences.len() > 1 {
+        return Err(format!(
+            "Template must contain exactly 1 sequence, found {}",
+            sequences.len()
+        ));
+    }
+
+    // Validate template has only standard bases (no gaps or ambiguities)
+    let seq = &sequences[0];
+    for (i, c) in seq.chars().enumerate() {
+        if !is_standard_base(c) {
+            return Err(format!(
+                "Template contains invalid character '{}' at position {}. Only A, C, G, T are allowed.",
+                c, i + 1
+            ));
+        }
+    }
+
+    Ok(TemplateData {
+        name: names[0].clone(),
+        sequence: sequences[0].clone(),
+    })
+}
+
+/// Parse multi-sequence FASTA as reference set (unaligned, no length normalization).
+pub fn parse_reference_fasta(text: &str) -> Result<ReferenceData, String> {
+    let (names, sequences) = parse_fasta_sequences(text)?;
+
+    if sequences.is_empty() {
+        return Err("No valid sequences found in reference input".to_string());
+    }
+
+    let mut data = ReferenceData::new();
+    data.names = names;
+    data.sequences = sequences;
+    Ok(data)
+}
+
+/// Core FASTA parsing: extract names and sequences from FASTA text.
+/// Does NOT normalize lengths (suitable for unaligned sequences).
+fn parse_fasta_sequences(text: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut names = Vec::new();
+    let mut sequences = Vec::new();
     let mut current_name = String::new();
     let mut current_seq = String::new();
 
@@ -50,27 +102,23 @@ pub fn parse_fasta(text: &str) -> Result<AlignmentData, String> {
         if let Some(name) = line.strip_prefix('>') {
             // Save previous sequence if exists
             if !current_seq.is_empty() {
-                data.names.push(current_name.clone());
-                data.sequences.push(current_seq.clone());
+                names.push(current_name.clone());
+                sequences.push(current_seq.clone());
                 current_seq.clear();
             }
             current_name = name.to_string();
         } else {
             // Append to current sequence, converting to uppercase
-            // and normalizing whitespace to gaps
             for c in line.chars() {
                 let c = c.to_ascii_uppercase();
-                if c.is_whitespace() || c == ' ' {
-                    current_seq.push('-');
-                } else if is_standard_base(c) || is_ambiguous_base(c) || is_gap(c) {
-                    // Normalize '.' gaps to '-'
+                if is_standard_base(c) || is_ambiguous_base(c) || is_gap(c) {
                     if c == '.' {
                         current_seq.push('-');
                     } else {
                         current_seq.push(c);
                     }
                 }
-                // Ignore other characters
+                // Ignore other characters (whitespace, numbers, etc.)
             }
         }
     }
@@ -78,14 +126,14 @@ pub fn parse_fasta(text: &str) -> Result<AlignmentData, String> {
     // Don't forget the last sequence
     if !current_seq.is_empty() {
         if current_name.is_empty() {
-            current_name = format!("Sequence_{}", data.sequences.len() + 1);
+            current_name = format!("Sequence_{}", sequences.len() + 1);
         }
-        data.names.push(current_name);
-        data.sequences.push(current_seq);
+        names.push(current_name);
+        sequences.push(current_seq);
     }
 
     // If no FASTA headers found, try treating each line as a sequence
-    if data.sequences.is_empty() {
+    if sequences.is_empty() {
         for (i, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('>') {
@@ -105,113 +153,13 @@ pub fn parse_fasta(text: &str) -> Result<AlignmentData, String> {
             }
 
             if !seq.is_empty() {
-                data.names.push(format!("Sequence_{}", i + 1));
-                data.sequences.push(seq);
+                names.push(format!("Sequence_{}", i + 1));
+                sequences.push(seq);
             }
         }
     }
 
-    if data.sequences.is_empty() {
-        return Err("No valid sequences found in input".to_string());
-    }
-
-    // Normalize lengths - find the maximum length and pad shorter sequences with gaps
-    let max_len = data.sequences.iter().map(|s| s.len()).max().unwrap_or(0);
-
-    for seq in &mut data.sequences {
-        if seq.len() < max_len {
-            seq.push_str(&"-".repeat(max_len - seq.len()));
-        }
-    }
-
-    data.alignment_length = max_len;
-
-    Ok(data)
-}
-
-/// Extract a window from all sequences at a given position
-pub fn extract_window(data: &AlignmentData, start: usize, length: usize) -> Vec<&str> {
-    let end = start + length;
-    data.sequences
-        .iter()
-        .filter_map(|seq| {
-            if end <= seq.len() {
-                Some(&seq[start..end])
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// Check if a sequence window contains gaps
-pub fn window_has_gaps(window: &str) -> bool {
-    window.chars().any(is_gap)
-}
-
-/// Check if a sequence window contains ambiguous bases
-pub fn window_has_ambiguous(window: &str) -> bool {
-    window.chars().any(is_ambiguous_base)
-}
-
-/// Filter sequences for a window, removing those with gaps or ambiguous bases
-/// Returns (filtered_sequences, gap_count, ambiguous_count)
-pub fn filter_window_sequences<'a>(
-    windows: &[&'a str],
-) -> (Vec<&'a str>, usize, usize) {
-    let mut filtered = Vec::new();
-    let mut gap_count = 0;
-    let mut ambiguous_count = 0;
-
-    for &window in windows {
-        let has_gap = window_has_gaps(window);
-        let has_ambiguous = window_has_ambiguous(window);
-
-        if has_gap {
-            gap_count += 1;
-        } else if has_ambiguous {
-            ambiguous_count += 1;
-        } else {
-            filtered.push(window);
-        }
-    }
-
-    (filtered, gap_count, ambiguous_count)
-}
-
-/// Compute consensus sequence (most common base at each position)
-pub fn compute_consensus(data: &AlignmentData) -> String {
-    if data.sequences.is_empty() {
-        return String::new();
-    }
-
-    let len = data.alignment_length;
-    let mut consensus = String::with_capacity(len);
-
-    for pos in 0..len {
-        let mut counts = std::collections::HashMap::new();
-
-        for seq in &data.sequences {
-            if let Some(c) = seq.chars().nth(pos) {
-                if is_standard_base(c) {
-                    *counts.entry(c).or_insert(0) += 1;
-                }
-            }
-        }
-
-        if counts.is_empty() {
-            consensus.push('-');
-        } else {
-            let most_common = counts
-                .into_iter()
-                .max_by_key(|&(_, count)| count)
-                .map(|(c, _)| c)
-                .unwrap_or('-');
-            consensus.push(most_common);
-        }
-    }
-
-    consensus
+    Ok((names, sequences))
 }
 
 #[cfg(test)]
@@ -219,17 +167,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_fasta() {
-        let fasta = ">Seq1\nACGT\n>Seq2\nACGT";
-        let data = parse_fasta(fasta).unwrap();
-        assert_eq!(data.sequences.len(), 2);
-        assert_eq!(data.sequences[0], "ACGT");
+    fn test_parse_template() {
+        let fasta = ">Template\nACGTACGT";
+        let data = parse_template_fasta(fasta).unwrap();
+        assert_eq!(data.name, "Template");
+        assert_eq!(data.sequence, "ACGTACGT");
     }
 
     #[test]
-    fn test_parse_fasta_with_gaps() {
-        let fasta = ">Seq1\nAC-T\n>Seq2\nACGT";
-        let data = parse_fasta(fasta).unwrap();
-        assert_eq!(data.sequences[0], "AC-T");
+    fn test_parse_template_rejects_multiple() {
+        let fasta = ">Seq1\nACGT\n>Seq2\nACGT";
+        assert!(parse_template_fasta(fasta).is_err());
+    }
+
+    #[test]
+    fn test_parse_template_rejects_gaps() {
+        let fasta = ">Template\nAC-TACGT";
+        assert!(parse_template_fasta(fasta).is_err());
+    }
+
+    #[test]
+    fn test_parse_references() {
+        let fasta = ">Ref1\nACGTACGT\n>Ref2\nACGTACGTTT\n>Ref3\nACGT";
+        let data = parse_reference_fasta(fasta).unwrap();
+        assert_eq!(data.len(), 3);
+        // Sequences should NOT be padded to same length
+        assert_eq!(data.sequences[0].len(), 8);
+        assert_eq!(data.sequences[1].len(), 10);
+        assert_eq!(data.sequences[2].len(), 4);
     }
 }
