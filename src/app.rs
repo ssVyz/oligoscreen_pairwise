@@ -52,6 +52,11 @@ pub struct OligoscreenApp {
     current_tab: Tab,
     zoom_level: f32,
 
+    // Results viewer settings (adjustable without re-running analysis)
+    view_coverage_threshold: f64,
+    color_green_at: usize,
+    color_red_at: usize,
+
     // Save/Load
     save_error: Option<String>,
     load_error: Option<String>,
@@ -110,6 +115,9 @@ impl Default for OligoscreenApp {
             detail_show_codon_spacing: true,
             current_tab: Tab::Input,
             zoom_level: 1.0,
+            view_coverage_threshold: 95.0,
+            color_green_at: 1,
+            color_red_at: 10,
             save_error: None,
             load_error: None,
             pending_save: false,
@@ -120,6 +128,41 @@ impl Default for OligoscreenApp {
 impl OligoscreenApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self::default()
+    }
+
+    /// Recalculate variants_for_threshold and coverage_at_threshold for all
+    /// positions using the current view_coverage_threshold, without re-running
+    /// the full analysis.
+    fn recalculate_coverage_threshold(&mut self) {
+        let threshold = self.view_coverage_threshold;
+        let Some(results) = &mut self.results else {
+            return;
+        };
+
+        for length_result in results.results_by_length.values_mut() {
+            for pos_result in &mut length_result.positions {
+                if pos_result.analysis.skipped {
+                    continue;
+                }
+                let mut cumulative = 0.0;
+                let mut new_needed = pos_result.analysis.variants.len();
+                let mut new_coverage = 0.0;
+                for (i, variant) in pos_result.analysis.variants.iter().enumerate() {
+                    cumulative += variant.percentage;
+                    if cumulative >= threshold {
+                        new_needed = i + 1;
+                        new_coverage = cumulative;
+                        break;
+                    }
+                }
+                if cumulative < threshold {
+                    new_coverage = cumulative;
+                }
+                pos_result.analysis.variants_for_threshold = new_needed;
+                pos_result.analysis.coverage_at_threshold = new_coverage;
+                pos_result.variants_needed = new_needed;
+            }
+        }
     }
 
     fn parse_template_input(&mut self) {
@@ -220,6 +263,7 @@ impl OligoscreenApp {
 
         if let Some(rx) = &self.results_rx {
             if let Ok(results) = rx.try_recv() {
+                self.view_coverage_threshold = results.params.coverage_threshold;
                 self.results = Some(results);
                 self.is_analyzing = false;
                 self.progress_rx = None;
@@ -263,6 +307,7 @@ impl OligoscreenApp {
             match std::fs::read_to_string(&path) {
                 Ok(json) => match serde_json::from_str::<ScreeningResults>(&json) {
                     Ok(results) => {
+                        self.view_coverage_threshold = results.params.coverage_threshold;
                         self.results = Some(results);
                         self.load_error = None;
                         self.current_tab = Tab::Results;
@@ -818,7 +863,7 @@ impl OligoscreenApp {
         ui.separator();
 
         // Extract data we need
-        let (lengths, template_seq, total_seqs, coverage_threshold) = {
+        let (lengths, template_seq, total_seqs) = {
             let results = self.results.as_ref().unwrap();
             let mut lengths: Vec<u32> = results.results_by_length.keys().copied().collect();
             lengths.sort();
@@ -826,7 +871,6 @@ impl OligoscreenApp {
                 lengths,
                 results.template_sequence.clone(),
                 results.total_sequences,
-                results.params.coverage_threshold,
             )
         };
 
@@ -835,7 +879,7 @@ impl OligoscreenApp {
             return;
         }
 
-        // Controls
+        // Controls row 1: zoom + info
         ui.horizontal(|ui| {
             ui.label("Zoom:");
             ui.add(egui::Slider::new(&mut self.zoom_level, 0.5..=3.0));
@@ -847,9 +891,40 @@ impl OligoscreenApp {
             ));
         });
 
+        // Controls row 2: coverage threshold + color range
+        ui.horizontal(|ui| {
+            ui.label("Coverage threshold (%):");
+            ui.add(
+                egui::DragValue::new(&mut self.view_coverage_threshold)
+                    .range(1.0..=100.0)
+                    .speed(0.5),
+            );
+            if ui.button("Apply").clicked() {
+                self.recalculate_coverage_threshold();
+            }
+            ui.separator();
+            ui.label("Color range - Green at:");
+            ui.add(
+                egui::DragValue::new(&mut self.color_green_at)
+                    .range(1..=1000),
+            );
+            ui.label("variants, Red at:");
+            ui.add(
+                egui::DragValue::new(&mut self.color_red_at)
+                    .range(1..=1000),
+            );
+            ui.label("variants");
+        });
+
+        // Ensure green <= red
+        if self.color_green_at > self.color_red_at {
+            self.color_red_at = self.color_green_at;
+        }
+
         ui.add_space(5.0);
 
         // Heatmap display
+        let coverage_threshold = self.view_coverage_threshold;
         self.show_heatmap(ui, &lengths, &template_seq, coverage_threshold);
 
         // Error messages
@@ -1036,7 +1111,12 @@ impl OligoscreenApp {
                                 } else {
                                     0.0
                                 };
-                                position_color(pr.variants_needed, no_match_frac)
+                                position_color(
+                                    pr.variants_needed,
+                                    no_match_frac,
+                                    self.color_green_at,
+                                    self.color_red_at,
+                                )
                             }
                         } else {
                             egui::Color32::from_rgb(30, 30, 30)
@@ -1105,26 +1185,44 @@ impl OligoscreenApp {
             });
 
         // Legend
+        // Legend: show a gradient from green_at to red_at using actual color function
         ui.add_space(5.0);
         ui.horizontal(|ui| {
             ui.label("Legend:");
             ui.add_space(10.0);
 
-            let legend_colors = [
-                (egui::Color32::from_rgb(0, 180, 0), "1 (best)"),
-                (egui::Color32::from_rgb(150, 180, 0), "2-5"),
-                (egui::Color32::from_rgb(255, 165, 0), "6-10"),
-                (egui::Color32::from_rgb(220, 50, 50), ">10"),
-                (egui::Color32::from_rgb(40, 40, 40), "skipped/no data"),
-            ];
+            // Show a few sample points across the configured range
+            let g = self.color_green_at;
+            let r = self.color_red_at;
+            let sample_points: Vec<(usize, String)> = if r <= g {
+                vec![(g, format!("<={}", g)), (g + 1, format!(">{}", g))]
+            } else {
+                let mid = (g + r) / 2;
+                let mut pts = vec![
+                    (g, format!("<={}", g)),
+                ];
+                if mid > g && mid < r {
+                    pts.push((mid, format!("{}", mid)));
+                }
+                pts.push((r, format!(">={}", r)));
+                pts
+            };
 
-            for (color, label) in legend_colors {
+            for (count, label) in &sample_points {
+                let color = position_color(*count, 0.0, g, r);
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
                 ui.painter().rect_filled(rect, 2.0, color);
                 ui.label(label);
-                ui.add_space(10.0);
+                ui.add_space(8.0);
             }
+
+            ui.separator();
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 2.0, egui::Color32::from_rgb(40, 40, 40));
+            ui.label("skipped/no data");
         });
     }
 
@@ -1382,37 +1480,47 @@ fn add_codon_spacing(seq: &str) -> String {
         .collect()
 }
 
-/// Get color for a position based on variant count and no-match fraction.
+/// Get color for a position based on variant count, no-match fraction,
+/// and user-configurable green/red thresholds.
 ///
-/// Green only when both variant count is low AND no-match fraction is low.
-/// High no-match fraction shifts the color toward red regardless of variant count.
-fn position_color(variant_count: usize, no_match_fraction: f64) -> egui::Color32 {
+/// - At `green_at` variants (or fewer): fully green
+/// - At `red_at` variants (or more): fully red
+/// - Between: linear interpolation from green to red
+/// - No-match fraction overrides toward red regardless of variant count
+fn position_color(
+    variant_count: usize,
+    no_match_fraction: f64,
+    green_at: usize,
+    red_at: usize,
+) -> egui::Color32 {
     if variant_count == 0 {
         return egui::Color32::from_rgb(40, 40, 40);
     }
 
-    // Base color from variant count (same scale as before)
-    let (base_r, base_g, base_b) = if variant_count == 1 {
-        (0u8, 180u8, 0u8) // Green - best
-    } else if variant_count <= 5 {
-        (150, 180, 0) // Yellow-green
-    } else if variant_count <= 10 {
-        (255, 165, 0) // Orange
+    // Compute base color by interpolating between green and red
+    let green = (0.0f64, 180.0f64, 0.0f64);
+    let red = (220.0f64, 50.0f64, 50.0f64);
+
+    let t = if red_at <= green_at {
+        // Degenerate case: everything at or above green_at is green, else red
+        if variant_count <= green_at { 0.0 } else { 1.0 }
+    } else if variant_count <= green_at {
+        0.0
+    } else if variant_count >= red_at {
+        1.0
     } else {
-        (220, 50, 50) // Red - worst
+        (variant_count - green_at) as f64 / (red_at - green_at) as f64
     };
 
-    // Blend toward red based on no-match fraction
-    // At 0% no-match: use base color as-is
-    // At 100% no-match: fully red
-    let nm = no_match_fraction.clamp(0.0, 1.0);
-    let red_r: u8 = 220;
-    let red_g: u8 = 50;
-    let red_b: u8 = 50;
+    let base_r = green.0 + (red.0 - green.0) * t;
+    let base_g = green.1 + (red.1 - green.1) * t;
+    let base_b = green.2 + (red.2 - green.2) * t;
 
-    let r = (base_r as f64 * (1.0 - nm) + red_r as f64 * nm) as u8;
-    let g = (base_g as f64 * (1.0 - nm) + red_g as f64 * nm) as u8;
-    let b = (base_b as f64 * (1.0 - nm) + red_b as f64 * nm) as u8;
+    // Blend toward red based on no-match fraction
+    let nm = no_match_fraction.clamp(0.0, 1.0);
+    let r = (base_r * (1.0 - nm) + red.0 * nm).clamp(0.0, 255.0) as u8;
+    let g = (base_g * (1.0 - nm) + red.1 * nm).clamp(0.0, 255.0) as u8;
+    let b = (base_b * (1.0 - nm) + red.2 * nm).clamp(0.0, 255.0) as u8;
 
     egui::Color32::from_rgb(r, g, b)
 }
