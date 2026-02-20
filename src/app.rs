@@ -56,6 +56,8 @@ pub struct OligoscreenApp {
     view_coverage_threshold: f64,
     color_green_at: usize,
     color_red_at: usize,
+    nomatch_ok_percent: f64,   // no-match ratio at or below this: original color (no darkening)
+    nomatch_bad_percent: f64,  // no-match ratio at or above this: fully dark red
 
     // Save/Load
     save_error: Option<String>,
@@ -118,6 +120,8 @@ impl Default for OligoscreenApp {
             view_coverage_threshold: 95.0,
             color_green_at: 1,
             color_red_at: 10,
+            nomatch_ok_percent: 5.0,
+            nomatch_bad_percent: 50.0,
             save_error: None,
             load_error: None,
             pending_save: false,
@@ -921,6 +925,29 @@ impl OligoscreenApp {
             self.color_red_at = self.color_green_at;
         }
 
+        // Controls row 3: no-match darkening thresholds
+        ui.horizontal(|ui| {
+            ui.label("No-match darkening - OK at:");
+            ui.add(
+                egui::DragValue::new(&mut self.nomatch_ok_percent)
+                    .range(0.0..=100.0)
+                    .speed(0.5)
+                    .suffix("%"),
+            );
+            ui.label(", Dark red at:");
+            ui.add(
+                egui::DragValue::new(&mut self.nomatch_bad_percent)
+                    .range(0.0..=100.0)
+                    .speed(0.5)
+                    .suffix("%"),
+            );
+        });
+
+        // Ensure ok <= bad
+        if self.nomatch_ok_percent > self.nomatch_bad_percent {
+            self.nomatch_bad_percent = self.nomatch_ok_percent;
+        }
+
         ui.add_space(5.0);
 
         // Heatmap display
@@ -1134,6 +1161,8 @@ impl OligoscreenApp {
                                     no_match_frac,
                                     self.color_green_at,
                                     self.color_red_at,
+                                    self.nomatch_ok_percent / 100.0,
+                                    self.nomatch_bad_percent / 100.0,
                                 )
                             }
                         } else {
@@ -1243,13 +1272,35 @@ impl OligoscreenApp {
                 pts
             };
 
+            let nm_ok = self.nomatch_ok_percent / 100.0;
+            let nm_bad = self.nomatch_bad_percent / 100.0;
+
             for (count, label) in &sample_points {
-                let color = position_color(*count, 0.0, g, r);
+                let color = position_color(*count, 0.0, g, r, nm_ok, nm_bad);
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
                 ui.painter().rect_filled(rect, 2.0, color);
                 ui.label(label);
                 ui.add_space(8.0);
+            }
+
+            ui.separator();
+
+            // No-match darkening legend: show a sample at midpoint variant count
+            let mid_count = (g + r) / 2;
+            let mid_count = if mid_count < 1 { 1 } else { mid_count };
+            let nm_samples = [
+                (nm_ok, format!("{}%", self.nomatch_ok_percent as u32)),
+                (nm_bad, format!("{}%", self.nomatch_bad_percent as u32)),
+            ];
+            ui.label("No-match:");
+            for (nm_frac, label) in &nm_samples {
+                let color = position_color(mid_count, *nm_frac, g, r, nm_ok, nm_bad);
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 2.0, color);
+                ui.label(label);
+                ui.add_space(4.0);
             }
 
             ui.separator();
@@ -1515,19 +1566,18 @@ fn add_codon_spacing(seq: &str) -> String {
         .collect()
 }
 
-/// Get color for a position based on variant count, no-match fraction,
-/// and user-configurable green/red thresholds.
+/// Get color for a position based on variant count and no-match fraction.
 ///
-/// Uses a 3-color gradient: green → yellow → red.
-/// - At `green_at` variants (or fewer): fully green
-/// - At midpoint between green_at and red_at: yellow
-/// - At `red_at` variants (or more): fully red
-/// - No-match fraction overrides toward red regardless of variant count
+/// Variant count gradient: green → yellow → red (configurable thresholds).
+/// No-match darkening (takes priority): original color → dark red,
+/// ramping between `nomatch_ok` and `nomatch_bad` fractions.
 fn position_color(
     variant_count: usize,
     no_match_fraction: f64,
     green_at: usize,
     red_at: usize,
+    nomatch_ok: f64,
+    nomatch_bad: f64,
 ) -> egui::Color32 {
     if variant_count == 0 {
         return egui::Color32::from_rgb(40, 40, 40);
@@ -1565,11 +1615,26 @@ fn position_color(
         )
     };
 
-    // Blend toward red based on no-match fraction
-    let nm = no_match_fraction.clamp(0.0, 1.0);
-    let r = (base_r * (1.0 - nm) + red.0 * nm).clamp(0.0, 255.0) as u8;
-    let g = (base_g * (1.0 - nm) + red.1 * nm).clamp(0.0, 255.0) as u8;
-    let b = (base_b * (1.0 - nm) + red.2 * nm).clamp(0.0, 255.0) as u8;
+    // No-match darkening: blend from base color toward dark red (100, 20, 20)
+    // nm_t=0 at nomatch_ok, nm_t=1 at nomatch_bad
+    let dark_red = (100.0f64, 20.0f64, 20.0f64);
+    let nm_frac = no_match_fraction.clamp(0.0, 1.0);
+    let nm_ok = nomatch_ok.clamp(0.0, 1.0);
+    let nm_bad = nomatch_bad.clamp(0.0, 1.0);
+
+    let nm_t = if nm_bad <= nm_ok {
+        if nm_frac <= nm_ok { 0.0 } else { 1.0 }
+    } else if nm_frac <= nm_ok {
+        0.0
+    } else if nm_frac >= nm_bad {
+        1.0
+    } else {
+        (nm_frac - nm_ok) / (nm_bad - nm_ok)
+    };
+
+    let r = (base_r * (1.0 - nm_t) + dark_red.0 * nm_t).clamp(0.0, 255.0) as u8;
+    let g = (base_g * (1.0 - nm_t) + dark_red.1 * nm_t).clamp(0.0, 255.0) as u8;
+    let b = (base_b * (1.0 - nm_t) + dark_red.2 * nm_t).clamp(0.0, 255.0) as u8;
 
     egui::Color32::from_rgb(r, g, b)
 }
